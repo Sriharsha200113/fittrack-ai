@@ -339,4 +339,5 @@ def format_weekly_report_text(data: dict) -> str:
         lines.append(f"🏅 New badges: {badge_str}\n")
 
     lines.append("Keep pushing! 🚀")
+    lines.append("\n📱 View full dashboard: https://web-eight-sepia-22.vercel.app")
     return "\n".join(lines)
