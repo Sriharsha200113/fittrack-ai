@@ -86,7 +86,7 @@ async def _count_protein_streak(user_id, db: AsyncSession) -> int:
                 DailyPoints.protein_hit == True,
             )
         )
-        if not result.scalar_one_or_none():
+        if not result.scalars().first():
             break
         streak += 1
         check_date -= timedelta(days=1)

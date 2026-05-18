@@ -7,10 +7,6 @@ from langchain.schema import SystemMessage, HumanMessage
 from backend.models.db_models import User, UserGoals
 from backend.services.redis_service import get_redis
 
-ACTIVITY_MULTIPLIERS = {
-    "sedentary": 1.2, "light": 1.375, "moderate": 1.55,
-    "active": 1.725, "very_active": 1.9,
-}
 ACTIVITY_LABELS = {
     "sedentary": "Sedentary 🪑", "light": "Light 🚶",
     "moderate": "Moderate 🏃", "active": "Active 💪", "very_active": "Very Active 🏆",
@@ -44,48 +40,40 @@ _llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 _NO_TARGET_GOALS = {"maintain", "endurance", "health"}
 
 
-def _calculate_targets(age, height_cm, weight_kg, gender, activity, goal_type, target_weight):
-    if gender == "female":
-        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age - 161
-    else:
-        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
-
-    tdee = bmr * ACTIVITY_MULTIPLIERS.get(activity, 1.55)
-
-    if goal_type == "lose":
-        calories = int(tdee - 500)
-        protein = int(weight_kg * 2.2)
-    elif goal_type == "gain":
-        calories = int(tdee + 250)
-        protein = int(weight_kg * 2.0)
-    elif goal_type == "recomp":
-        calories = int(tdee)
-        protein = int(weight_kg * 2.4)  # high protein for recomp
-    elif goal_type == "strength":
-        calories = int(tdee + 150)
-        protein = int(weight_kg * 2.2)
-    elif goal_type == "endurance":
-        calories = int(tdee)
-        protein = int(weight_kg * 1.4)
-    else:  # maintain / health / custom
-        calories = int(tdee)
-        protein = int(weight_kg * 1.6)
-
-    calories = max(calories, 1200)
-    fat = int(calories * 0.25 / 9)
-    carbs = max(int((calories - protein * 4 - fat * 9) / 4), 0)
-
-    time_est = None
-    if goal_type == "lose" and target_weight < weight_kg:
-        weeks = max(int((weight_kg - target_weight) * 2), 1)
-        time_est = f"~{weeks} weeks"
-    elif goal_type in ("gain", "strength") and target_weight > weight_kg:
-        weeks = max(int((target_weight - weight_kg) * 4), 1)
-        time_est = f"~{weeks} weeks"
-    elif goal_type == "recomp":
-        time_est = "~12–16 weeks for visible recomp"
-
-    return {"calories": calories, "protein": protein, "carbs": carbs, "fat": fat, "time_est": time_est}
+async def _calculate_targets(age, height_cm, weight_kg, gender, activity, goal_type, target_weight):
+    prompt = (
+        f"Calculate personalized daily nutrition targets for this person:\n"
+        f"- Age: {age} years\n"
+        f"- Height: {height_cm} cm\n"
+        f"- Current weight: {weight_kg} kg\n"
+        f"- Gender: {gender}\n"
+        f"- Activity level: {activity}\n"
+        f"- Goal: {goal_type}\n"
+        f"- Target weight: {target_weight} kg\n\n"
+        f"Use your nutritional expertise (consider TDEE, goal-specific adjustments, Indian diet context).\n"
+        f"For time_est: estimate realistic weeks to reach target weight, or null if no weight change goal.\n\n"
+        f"Respond ONLY in this exact JSON format:\n"
+        f'{{"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "time_est": "~X weeks or null"}}'
+    )
+    resp = await _llm.ainvoke([
+        SystemMessage(content="You are a certified nutritionist. Respond only with the requested JSON."),
+        HumanMessage(content=prompt),
+    ])
+    try:
+        content = resp.content.strip()
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        data = json.loads(content[start:end])
+        return {
+            "calories": max(int(data.get("calories", 2000)), 1200),
+            "protein": int(data.get("protein", 150)),
+            "carbs": int(data.get("carbs", 200)),
+            "fat": int(data.get("fat", 65)),
+            "time_est": data.get("time_est") if data.get("time_est") not in (None, "null") else None,
+        }
+    except Exception:
+        # Fallback to safe defaults if LLM response unparseable
+        return {"calories": 2000, "protein": 150, "carbs": 200, "fat": 65, "time_est": None}
 
 
 async def _classify_custom_goal(text: str) -> tuple[str, str]:
@@ -327,7 +315,7 @@ async def handle_onboarding(message: str, user: User, db: AsyncSession) -> str:
         target_weight = float(state.get("target_weight", weight))
         goal_label = state.get("goal_label", GOAL_LABELS.get(goal_type, goal_type))
 
-        t = _calculate_targets(age, height_cm, weight, gender, activity, goal_type, target_weight)
+        t = await _calculate_targets(age, height_cm, weight, gender, activity, goal_type, target_weight)
 
         await save({
             "step": "confirm",
@@ -358,7 +346,7 @@ async def handle_onboarding(message: str, user: User, db: AsyncSession) -> str:
         lines += [
             f"\n✅ Reply *YES* to confirm and start tracking!",
             f"✏️ Reply *EDIT* to change your goals",
-            f"🔢 Reply *custom calories* or just type a number _(e.g. 2500)_ to set your own",
+            f"🔢 Type a number _(e.g. 2500)_ to set custom calories, or _protein 160g_ for custom protein",
             f"↩️ Reply *BACK* to change activity level",
         ]
         return "\n".join(lines)
@@ -375,6 +363,31 @@ async def handle_onboarding(message: str, user: User, db: AsyncSession) -> str:
             await r.delete(key)
             await save({**kept, "step": "goal_type"})
             return f"No problem! Let's redo your goals.\n\n{GOAL_MENU}"
+
+        # Custom protein override — user types "protein 160g" or "160g protein" or "protein 160"
+        protein_match = re.search(r'(?:protein\s*(\d{2,3})\s*g?|(\d{2,3})\s*g?\s*protein)', message, re.IGNORECASE)
+        if protein_match:
+            custom_protein = int(protein_match.group(1) or protein_match.group(2))
+            if 30 <= custom_protein <= 400:
+                cur_cal = int(state.get("calc_calories", 2000))
+                cur_fat = int(state.get("calc_fat", 65))
+                carbs = max(int((cur_cal - custom_protein * 4 - cur_fat * 9) / 4), 0)
+                await save({
+                    "calc_protein": str(custom_protein),
+                    "calc_carbs": str(carbs),
+                })
+                goal_label = state.get("goal_label", GOAL_LABELS.get(state.get("goal_type", "maintain"), ""))
+                activity = state.get("activity", "moderate")
+                return (
+                    f"✏️ *Updated targets:*\n\n"
+                    f"🎯 Goal: {goal_label}\n"
+                    f"⚡ Activity: {ACTIVITY_LABELS.get(activity, activity)}\n\n"
+                    f"🔥 Calories: *{cur_cal} kcal*\n"
+                    f"🥩 Protein:  *{custom_protein}g* _(custom)_\n"
+                    f"🌾 Carbs:    *{carbs}g*\n"
+                    f"🥑 Fat:      *{cur_fat}g*\n\n"
+                    f"✅ Reply *YES* to confirm or adjust further"
+                )
 
         # Custom calorie override — user types a number like "2500" or "set 2200 calories"
         cal_nums = re.findall(r'\b(\d{3,4})\b', message)
@@ -409,7 +422,7 @@ async def handle_onboarding(message: str, user: User, db: AsyncSession) -> str:
             )
 
         if msg not in ("yes", "y", "ok", "okay", "confirm", "sure", "looks good", "perfect", "great", "yep", "yup"):
-            return "Please reply *YES* to confirm your targets, *EDIT* to change goals, or enter a custom calorie number (e.g. 2500)."
+            return "Please reply *YES* to confirm your targets, *EDIT* to change goals, enter a calorie number _(e.g. 2500)_, or set protein _(e.g. protein 160g)_."
 
         state = await r.hgetall(key) or {}
         name = state.get("name", user.name or "")

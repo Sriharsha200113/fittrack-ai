@@ -117,6 +117,57 @@ async def handle_diet(message: str, user: User, squad: Squad, db: AsyncSession, 
     return "\n".join(lines)
 
 
+async def correct_meal(correction: str, user: User) -> str:
+    """Apply a text correction to a pending meal and re-store it in Redis."""
+    r = await get_redis()
+    raw = await r.get(f"pending_meal:{user.phone}")
+    if not raw:
+        return "No pending meal to correct. Please log your meal first."
+
+    current = json.loads(raw)
+    items_summary = "\n".join(
+        f"- {item['name']} ({item['quantity']}): {round(item['calories'])} kcal, P:{round(item['protein_g'])}g C:{round(item['carbs_g'])}g F:{round(item['fat_g'])}g"
+        for item in current.get("food_items", [])
+    )
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=(
+            f"Current meal breakdown:\n{items_summary}\n\n"
+            f"User correction: {correction}\n\n"
+            f"Apply the correction (update quantities, add missing items, remove items as needed) "
+            f"and return the full updated meal in JSON format."
+        )),
+    ]
+    response = await llm.ainvoke(messages)
+    data = _parse_llm_json(response.content)
+
+    if not data:
+        return "I couldn't apply that correction. Please describe the change clearly (e.g. 'chicken was 200g, add dal 100g')."
+
+    raw_text = ", ".join(item["name"] for item in data.get("food_items", [])) or current.get("raw_text", "")
+    data["raw_text"] = raw_text
+    await r.set(f"pending_meal:{user.phone}", json.dumps(data), ex=PENDING_TTL)
+
+    items = data.get("food_items", [])
+    cal = round(data.get("total_calories", 0))
+    p = round(data.get("total_protein_g", 0))
+    c = round(data.get("total_carbs_g", 0))
+    f = round(data.get("total_fat_g", 0))
+    meal_type = data.get("meal_type", "meal").capitalize()
+
+    lines = [f"✏️ *{meal_type} updated:*\n"]
+    for item in items:
+        lines.append(f"• {item['name']} ({item['quantity']}) — {round(item['calories'])} kcal | P:{round(item['protein_g'])}g C:{round(item['carbs_g'])}g F:{round(item['fat_g'])}g")
+
+    lines += [
+        f"\n*Total:* {cal} kcal | Protein: {p}g | Carbs: {c}g | Fat: {f}g",
+        f"\n✅ Reply *YES* to log this meal",
+        f"❌ Reply *NO* to cancel",
+    ]
+    return "\n".join(lines)
+
+
 async def confirm_meal(user: User, squad: Squad, db: AsyncSession) -> str:
     r = await get_redis()
     raw = await r.get(f"pending_meal:{user.phone}")

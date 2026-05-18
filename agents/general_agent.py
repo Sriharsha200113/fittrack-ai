@@ -1,13 +1,9 @@
 from datetime import date
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from langchain_openai import ChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
 from backend.models.db_models import MealLog, ExerciseLog, UserGoals, User, Squad
 from backend.services.leaderboard_service import get_daily_leaderboard
 from backend.services.streak_service import get_streak
-
-_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 
 MEDALS = ["🥇", "🥈", "🥉"]
 
@@ -15,17 +11,15 @@ MEDALS = ["🥇", "🥈", "🥉"]
 async def handle_general(intent: str, message: str, user: User, squad: Squad, db: AsyncSession) -> str:
     msg_lower = message.lower()
 
-    if any(kw in msg_lower for kw in ["my report", "weekly report", "my stats report", "report"]):
-        return await _on_demand_weekly_report(user, db)
-    elif any(kw in msg_lower for kw in ["monthly report", "my monthly"]):
+    if any(kw in msg_lower for kw in ["monthly report", "my monthly"]):
         return await _on_demand_monthly_report(user, squad, db)
-
-    if intent == "leaderboard":
+    if any(kw in msg_lower for kw in ["my report", "weekly report", "report"]):
+        return await _on_demand_weekly_report(user, db)
+    if any(kw in msg_lower for kw in ["leaderboard", "ranking", "who is winning", "top"]):
         return await _leaderboard(squad, db)
-    elif intent == "stats":
-        return await _personal_stats(user, squad, db)
-    else:
-        return await _conversational(message, user)
+
+    # Default: personal stats (supervisor already handles pure conversation)
+    return await _personal_stats(user, squad, db)
 
 
 async def _leaderboard(squad: Squad, db: AsyncSession) -> str:
@@ -154,17 +148,6 @@ async def _on_demand_monthly_report(user: User, squad: Squad, db: AsyncSession) 
     return f"📊 Your monthly report PDF is on the way, {user.name}!"
 
 
-async def _conversational(message: str, user: User) -> str:
-    response = await _llm.ainvoke([
-        SystemMessage(content=(
-            f"You are FitBot, a friendly AI fitness coach on WhatsApp. "
-            f"The user's name is {user.name}. "
-            f"Answer their question helpfully and concisely in 2-3 sentences. "
-            f"If they seem to need help with commands, mention they can tag @FitBot with their meal or workout."
-        )),
-        HumanMessage(content=message),
-    ])
-    return response.content.strip()
 
 
 def _help_message(user: User) -> str:

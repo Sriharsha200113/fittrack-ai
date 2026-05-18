@@ -6,10 +6,20 @@ from backend.services.user_service import get_or_create_user
 from backend.services.squad_service import get_or_create_squad, ensure_member
 from backend.agents.supervisor import process
 from backend.agents.onboarding_agent import handle_onboarding
-from backend.models.db_models import User
+from backend.models.db_models import User, SquadMember, Squad
 from backend.db.session import get_db
 
 router = APIRouter()
+
+
+async def _get_user_squad(user: User, db: AsyncSession) -> Squad | None:
+    result = await db.execute(
+        select(Squad)
+        .join(SquadMember, SquadMember.squad_id == Squad.id)
+        .where(SquadMember.user_id == user.id)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 @router.post("/webhook/dm", response_model=WebhookResponse)
@@ -18,13 +28,12 @@ async def dm_webhook(
     db: AsyncSession = Depends(get_db),
 ):
     user = await get_or_create_user(payload.phone, payload.sender_name, db)
-    if user.is_onboarded:
-        return WebhookResponse(reply=(
-            f"✅ You're already registered, {user.name}!\n\n"
-            f"Head to the group and tag me to log your meals and workouts.\n"
-            f"E.g. _@FitBot had chicken rice for lunch_ 💪"
-        ))
-    reply = await handle_onboarding(payload.message, user, db)
+    if not user.is_onboarded:
+        reply = await handle_onboarding(payload.message, user, db)
+        return WebhookResponse(reply=reply)
+
+    squad = await _get_user_squad(user, db)
+    reply = await process(user, squad, payload.message, db, payload.image_data, payload.image_mimetype)
     return WebhookResponse(reply=reply)
 
 
