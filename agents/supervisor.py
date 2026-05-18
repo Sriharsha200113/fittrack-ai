@@ -101,15 +101,23 @@ async def _supervisor(state: FitState) -> dict:
         user_name=state["user"].name or "User",
         goals_context=ctx,
     )
-    decision: RouteDecision = await _supervisor_llm.ainvoke([
+    raw = await _supervisor_llm.ainvoke([
         SystemMessage(content=system),
         HumanMessage(content=state["message"]),
     ])
 
-    if decision.next == "FINISH":
-        return {"response": decision.direct_response, "intent": "__done__"}
+    # with_structured_output may return a dict or a pydantic model depending on version
+    if isinstance(raw, dict):
+        next_val = raw.get("next", "general")
+        direct = raw.get("direct_response", "")
+    else:
+        next_val = raw.next
+        direct = raw.direct_response
 
-    return {"intent": decision.next}
+    if next_val == "FINISH":
+        return {"response": direct, "intent": "__done__"}
+
+    return {"intent": next_val}
 
 
 async def _diet(state: FitState) -> dict:
